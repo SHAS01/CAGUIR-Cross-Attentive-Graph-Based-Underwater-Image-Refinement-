@@ -1,0 +1,166 @@
+# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import re  # Import regex module for parsing checkpoint filenames
+
+import os
+import argparse
+import time
+import utils
+from tqdm import tqdm
+from loss import Charbonnier_Loss, SSIM_Loss, torchPSNR, torchFSIM, torchUIQM, torchUCIQE
+
+from networks import graph_network
+
+from graphmethods import build_adjacency_matrices
+
+def train(config):
+    # Set CUDA device
+    torch.cuda.set_device(int(config.cudaid))
+    device = torch.device(f"cuda:{config.cudaid}")
+    
+    # Initialize the graph network with hidden layer size 1500 and 2 layers
+    graph_net_model = graph_network.graph_net(config.block_size, hidden_size=1500, num_layers=2).to(device)
+
+    Trainable_params = sum(p.numel() for p in graph_net_model.parameters() if p.requires_grad)
+    print(f'Trainable params: {Trainable_params / 1e6}M')
+
+    print("gpu_id:", config.cudaid)
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = config.cudaid
+    device_ids = [i for i in range(torch.cuda.device_count())]
+    
+    if torch.cuda.device_count() > 1:
+        graph_net_model = nn.DataParallel(graph_net_model, device_ids=device_ids)
+
+    train_dataset = utils.train_val_loader(config.enhan_images_path, config.ori_images_path)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=4,  # Batch size set to 2
+        shuffle=True, 
+        num_workers=config.num_workers, 
+        pin_memory=True
+    )
+
+    ######### Graph_adj ###########
+    train_adj = build_adjacency_matrices(train_loader, config.block_size)
+
+    ######### Optimizer ###########
+    optimizer = optim.Adam(graph_net_model.parameters(), lr=1e-6)  # Learning rate set to 1e-6
+
+    criterion_char = Charbonnier_Loss()
+    criterion_ssim = SSIM_Loss()
+
+    # Check if a checkpoint exists; if yes, load the latest checkpoint
+    checkpoint_dir = os.path.join(config.checkpoint_path, config.net_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Find the latest checkpoint based on the filename pattern
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.match(r'model_run\d+_epoch\d+\.pth', f)]
+    if checkpoint_files:
+        # Sort checkpoints by epoch number
+        checkpoint_files.sort(key=lambda x: int(re.search(r'epoch(\d+)', x).group(1)), reverse=True)
+        latest_checkpoint = checkpoint_files[0]
+        checkpoint_file = os.path.join(checkpoint_dir, latest_checkpoint)
+        print(f"Loading checkpoint from {checkpoint_file}")
+        checkpoint = torch.load(checkpoint_file)
+        graph_net_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming training from epoch {start_epoch}")
+    else:
+        print("No checkpoint found, training from scratch.")
+        start_epoch = 1
+
+    graph_net_model.train()
+
+    for run in range(1, 11):  # Repeat training for 10 runs
+        print(f"Starting Run {run}/10")
+        for epoch in range(start_epoch, 101):  # Train for 100 epochs
+            train_loss = []
+            psnr_list = []
+            ssim_metric_list = []
+            fsim_list = []
+            uiqm_list = []
+            uciqe_list = []
+
+            for i, (img_clean, img_ori) in enumerate(tqdm(train_loader)):
+                img_clean = img_clean.cuda()
+                img_ori = img_ori.cuda()
+
+                try:
+                    train_adj_batch = torch.tensor(train_adj[i]).cuda()
+                    enhanced_image = graph_net_model(img_ori, train_adj_batch)
+                    # Compute losses/metrics
+                    loss_val = 0.5 * criterion_char(img_clean, enhanced_image) + 0.5 * (1 - criterion_ssim(img_clean, enhanced_image))  # a and ß set to 0.5
+                    psnr = torchPSNR(enhanced_image, img_clean)
+                    ssim_metric = criterion_ssim(img_clean, enhanced_image)
+
+                    # Compute additional quality metrics
+                    fsim_val = torchFSIM(img_clean, enhanced_image)
+                    uiqm_val = torchUIQM(img_clean, enhanced_image)
+                    uciqe_val = torchUCIQE(img_clean, enhanced_image)
+                   
+                    train_loss.append(loss_val.item())
+                    psnr_list.append(psnr.item())
+                    ssim_metric_list.append(ssim_metric.item())
+                    fsim_list.append(fsim_val.item())
+                    uiqm_list.append(uiqm_val.item())
+                    uciqe_list.append(uciqe_val.item())
+
+                    optimizer.zero_grad()
+                    loss_val.backward()
+                    optimizer.step()
+
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print(e)
+                        torch.cuda.empty_cache()
+                    else:
+                        raise e
+
+            avg_loss = np.mean(train_loss)
+            avg_psnr = np.mean(psnr_list)
+            avg_ssim = np.mean(ssim_metric_list)
+            avg_fsim = np.mean(fsim_list)
+            avg_uiqm = np.mean(uiqm_list)
+            avg_uciqe = np.mean(uciqe_list)
+            epoch_message = (f"Run {run}, Epoch {epoch}: Mean Loss: {avg_loss:.4f}, Mean PSNR: {avg_psnr:.2f} dB, "
+                             f"Mean SSIM: {avg_ssim:.4f}, Mean FSIM: {avg_fsim:.4f}, "
+                             f"Mean UIQM: {avg_uiqm:.4f}, Mean UCIQE: {avg_uciqe:.4f}")
+            print(epoch_message)
+            
+            # Save metrics to log file
+            log_file = os.path.join(checkpoint_dir, "training_metrics.log")
+            with open(log_file, "a") as log:
+                log.write(epoch_message + "\n")
+            
+            # Save checkpoint every 10 epochs
+            if epoch % 10 == 0:
+                checkpoint_state = {
+                    'epoch': epoch,
+                    'model_state_dict': graph_net_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict()
+                }
+                torch.save(checkpoint_state, os.path.join(checkpoint_dir, f'model_run{run}_epoch{epoch}.pth'))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--block_size', type=int, default=16)
+    parser.add_argument('--net_name', type=str, default="LOL")
+    parser.add_argument('--enhan_images_path', type=str, default="/workspace/rds/dataset/LOL/train/high")
+    parser.add_argument('--ori_images_path', type=str, default="/workspace/rds/dataset/LOL/train/low")
+    parser.add_argument('--num_workers', type=int, default=6)
+    parser.add_argument('--checkpoint_path', type=str, default="/workspace/abc/trained_model/")
+    parser.add_argument('--cudaid', type=str, default="1", help="choose cuda device id 0-7).")
+
+    config = parser.parse_args()
+
+    torch.cuda.empty_cache()
+    s = time.time()
+    train(config)
+    e = time.time()
+    print(f"Training completed in {e - s:.2f} seconds.")
